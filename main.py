@@ -1,0 +1,63 @@
+import io
+import json
+import logging
+from pathlib import Path
+
+import pandas as pd
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from src import DatasetInfo, DatasetStorage, HealthResponse, setup_logging
+
+setup_logging(verbose=True)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Data Processing API", version="1.0.0")
+storage = DatasetStorage()
+
+@app.get("/health", response_model=HealthResponse)
+def health_check():
+ """Return the application status and version."""
+ return{
+  "status": "ok",
+  "version": "1.0.0"
+ }
+
+
+@app.post("/upload", response_model=DatasetInfo)
+async def upload_dataset(file: UploadFile = File(...)):
+    """Read and store a CSV upload."""
+
+    extension = Path(file.filename or "").suffix.lower()
+
+    if extension != ".csv":
+        logger.warning("Unsupported file format: %s", extension)
+        raise HTTPException(
+            status_code=400,
+            detail="Only CSV files are supported"
+        )
+
+    contents = await file.read()
+
+    try:
+        df = pd.read_csv(io.BytesIO(contents))
+
+    except (
+        pd.errors.EmptyDataError,
+        pd.errors.ParserError,
+        UnicodeDecodeError
+    ) as e:
+        logger.warning("Invalid CSV upload: %s", e)
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to read the CSV file"
+        )
+    
+    dataset_id = storage.save(df, file.filename)
+
+    logger.info(
+        "Uploaded dataset: id=%s, filename=%s, rows=%s",
+        dataset_id,
+        file.filename,
+        len(df)
+    )
+
+    return storage.get_metadata(dataset_id)
