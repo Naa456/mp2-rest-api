@@ -1,17 +1,52 @@
+#to load virtual environment, do 
+#  .\venv\Scripts\python.exe -m uvicorn main:app --reload
+#if virtual already activated, just run python -m uvicorn main:app --reload
+# this is the link/local address to access the API documentation: : http://127.0.0.1:8000/docs
+#this is to run some test(automated test that checks whether other parts of our code behave correctly)
+#to run tests, use: pytest : .\venv\Scripts\python.exe -m pytest -q
 import io
 import json
 import logging
 from pathlib import Path
+import time
+import uuid
+from fastapi import Request
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from src import DatasetInfo, DatasetStorage, HealthResponse, setup_logging
+from src import DatasetInfo, DatasetStorage, HealthResponse, setup_logging, ProcessConfig, ProcessingReport
+from data_pipeline import (
+    validate_dataframe,
+    process_data,
+    create_cleaning_report
+)
 
 setup_logging(verbose=True)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Data Processing API", version="1.0.0")
 storage = DatasetStorage()
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+
+    request_id = uuid.uuid4().hex[:8]
+    start = time.perf_counter()
+
+    response = await call_next(request)
+
+    duration = time.perf_counter() - start
+
+    logger.info(
+        f"ID={request_id} "
+        f"Status={response.status_code} "
+        f"Duration={duration:.3f}s"
+    )
+
+    response.headers["X-Request-ID"] = request_id
+
+    return response
+
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -47,20 +82,55 @@ async def upload_dataset(file: UploadFile = File(...)):
     return storage.get_metadata(dataset_id)
 
 
-@app.get("/datasets/{dataset_id}")
-def get_dataset(dataset_id: int, limit: int = Query(default=100, ge=1)):
-    """Return up to limit rows from a stored dataset."""
+@app.post(
+    "/datasets/{dataset_id}/process",
+    response_model=ProcessingReport
+)
+def process_dataset(dataset_id: int, config: ProcessConfig):
     df = storage.get(dataset_id)
 
     if df is None:
-        logger.warning("Dataset not found: %s", dataset_id)
-        raise HTTPException(status_code=404, detail="Dataset not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset not found"
+        )
 
-    records = json.loads(df.head(limit).to_json(orient="records"))
-    logger.info("Retrieved dataset: id=%s, returned_rows=%s", dataset_id, len(records))
+    config_dict = config.model_dump()
 
+    for column in config.validation.numeric_columns:
+        if column not in df.columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Numeric column '{column}' not found"
+            )
+
+    try:
+        validated_df = validate_dataframe(
+            df,
+            config.validation.required_columns,
+            config.validation.numeric_columns
+        )
+
+        validation_rows_removed = len(df) - len(validated_df)
+        before_processing = validated_df.copy()
+
+        processed_df = process_data(
+            validated_df,
+            config_dict
+        )
+
+        cleaning_report = create_cleaning_report(
+            before_processing,
+            processed_df
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
     return {
         "id": dataset_id,
-        "data": records,
-        "total_rows": len(df),
+        "validation_rows_removed": validation_rows_removed,
+        "cleaning_report": cleaning_report
     }
